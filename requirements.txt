@@ -24,3 +24,8 @@ sqlite3
 atexit
 signal
 concurrent.futures
+# Existing requirements remain...
+# Add for institutional safety:
+apscheduler>=3.10.0  # Optional: If you want to upgrade to APScheduler later
+# Python 3.9+ compatible (no TaskGroup needed, using manual supervisor for 3.9-3.10 compatibility)
+
