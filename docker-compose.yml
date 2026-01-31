@@ -1,0 +1,49 @@
+version: '3.8'
+
+services:
+  volguard:
+    build: .
+    container_name: volguard-api
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    environment:
+      - UPSTOX_ACCESS_TOKEN=${UPSTOX_ACCESS_TOKEN}
+      - UPSTOX_REFRESH_TOKEN=${UPSTOX_REFRESH_TOKEN}
+      - UPSTOX_CLIENT_ID=${UPSTOX_CLIENT_ID}
+      - UPSTOX_CLIENT_SECRET=${UPSTOX_CLIENT_SECRET}
+      - UPSTOX_REDIRECT_URI=${UPSTOX_REDIRECT_URI}
+      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
+      - TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID}
+      - GROQ_API_KEY=${GROQ_API_KEY}
+      - VG_BASE_CAPITAL=${VG_BASE_CAPITAL:-1000000}
+      - VG_DRY_RUN=${VG_DRY_RUN:-TRUE}
+      - VG_MAX_LOSS_PER_TRADE=${VG_MAX_LOSS_PER_TRADE:-50000}
+      - VG_MAX_CAPITAL_PER_TRADE=${VG_MAX_CAPITAL_PER_TRADE:-300000}
+      - MAX_TRADES_PER_DAY=${MAX_TRADES_PER_DAY:-3}
+      - VG_MAX_DRAWDOWN_PCT=${VG_MAX_DRAWDOWN_PCT:-0.15}
+    volumes:
+      - volguard-data:/app/data
+      - volguard-logs:/app/logs
+    networks:
+      - volguard-network
+
+  # Optional: Prometheus for metrics
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: volguard-prometheus
+    restart: unless-stopped
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml
+    ports:
+      - "9090:9090"
+    networks:
+      - volguard-network
+
+volumes:
+  volguard-data:
+  volguard-logs:
+
+networks:
+  volguard-network:
+    driver: bridge
