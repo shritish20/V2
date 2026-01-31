@@ -1,13 +1,13 @@
 """
-Analysis Endpoints
+Analysis Endpoints - Production Fixed
+Uses run_in_threadpool for CPU-intensive analytics
 """
 from fastapi import APIRouter, Depends, Request
+from starlette.concurrency import run_in_threadpool
 from typing import Dict, Any
-from multiprocessing import Queue
 
 from app.services.analytics.engine import AnalyticsEngine
 from app.services.analytics.regime import RegimeEngineV33
-from app.api.deps import get_upstox_client
 from app.core.config import settings
 
 router = APIRouter()
@@ -15,16 +15,14 @@ router = APIRouter()
 @router.post("/run")
 async def run_analysis(request: Request):
     """Run market analysis and return regime mandates"""
-    result_queue = Queue()
+    # Run CPU-intensive analytics in threadpool to avoid blocking event loop
+    engine = AnalyticsEngine()
     config = {'access_token': settings.UPSTOX_ACCESS_TOKEN}
     
-    engine = AnalyticsEngine(result_queue)
-    engine.run(config)
+    result = await run_in_threadpool(engine.run_sync, config)
     
-    status, result = result_queue.get()
-    
-    if status != 'success':
-        return {"status": "error", "message": result}
+    if result.get('status') != 'success':
+        return {"status": "error", "message": result.get('message', 'Unknown error')}
     
     regime_engine = RegimeEngineV33()
     
