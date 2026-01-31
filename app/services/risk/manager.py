@@ -1,11 +1,13 @@
 """
-Risk Manager - Preserved
+Risk Manager - Production Fixed
+Async-compatible, injection-based, no circular imports
 """
+import asyncio
 import time
 import logging
 import traceback
 from datetime import date
-from typing import List, Dict
+from typing import List, Dict, Optional, Callable
 
 import upstox_client
 from upstox_client.api.market_quote_api import MarketQuoteV3Api
@@ -21,7 +23,16 @@ from app.integrations.upstox.websockets import LiveGreeksManager
 logger = logging.getLogger("VOLGUARD")
 
 class RiskManager:
-    def __init__(self, api_client: upstox_client.ApiClient, legs: List[Dict], expiry_date: date, trade_id: str, gtt_ids: List[str], db_writer: DatabaseWriter, circuit_breaker: CircuitBreaker, greeks_mgr: LiveGreeksManager):
+    def __init__(self, 
+                 api_client: upstox_client.ApiClient, 
+                 legs: List[Dict], 
+                 expiry_date: date, 
+                 trade_id: str, 
+                 gtt_ids: List[str], 
+                 db_writer: DatabaseWriter, 
+                 circuit_breaker: CircuitBreaker, 
+                 greeks_mgr: LiveGreeksManager,
+                 flatten_callback: Optional[Callable] = None):
         self.api_client = api_client
         self.legs = legs
         self.expiry = expiry_date
@@ -33,6 +44,7 @@ class RiskManager:
         self.circuit_breaker = circuit_breaker
         self.telegram = TelegramAlerter()
         self.greeks_mgr = greeks_mgr
+        self.flatten_callback = flatten_callback
         
         credit = sum(l['entry_price'] * l['filled_qty'] for l in legs if l['side'] == 'SELL')
         debit = sum(l['entry_price'] * l['filled_qty'] for l in legs if l['side'] == 'BUY')
@@ -57,9 +69,8 @@ class RiskManager:
 
         logger.info(f"Risk Manager Init: Trade={trade_id} | Premium=₹{self.net_premium:,.2f} | Max Risk=₹{self.max_spread_loss:,.2f}")
 
-    def monitor(self):
-        from app.services.trading.execution import ExecutionEngine
-        
+    async def monitor_async(self):
+        """Async version of monitor for asyncio task"""
         market_api = MarketQuoteV3Api(self.api_client)
         consecutive_errors = 0
         max_consecutive_errors = 10
@@ -67,15 +78,16 @@ class RiskManager:
         
         while self.running:
             try:
+                # Check Greeks every 5 seconds
                 current_time = time.time()
-                if int(current_time) % 5 == 0 and self.greeks_mgr.subscribed_keys:
+                if int(current_time) % 5 == 0:
                     warnings = self.greeks_mgr.check_risk_limits(self.legs, self.trade_id)
                     for warning in warnings:
                         if 'CRITICAL' in warning:
                             logger.critical(warning)
                             if 'θ/ν Ratio' in warning and 'CRITICAL' in warning:
                                 logger.critical("Auto-flattening due to extreme Theta/Vega ratio")
-                                self.flatten_all("THETA_VEGA_RATIO_CRITICAL")
+                                await self.flatten_all_async("THETA_VEGA_RATIO_CRITICAL")
                                 return
                         else:
                             logger.warning(warning)
@@ -91,30 +103,39 @@ class RiskManager:
                             f"θ/ν:{port['theta_vega_ratio']:.2f}"
                         )
                 
+                # DTE Check
                 days_to_expiry = (self.expiry - date.today()).days
                 if days_to_expiry <= settings.EXIT_DTE:
                     logger.info(f"DTE exit trigger: {days_to_expiry} days remaining")
-                    self.flatten_all("DTE_EXIT")
+                    await self.flatten_all_async("DTE_EXIT")
                     return
 
+                # Fetch Prices (Sync API, run in thread)
                 keys = [l['key'] for l in self.legs]
-                price_response = None
-                for attempt in range(3):
-                    try:
-                        price_response = market_api.get_ltp(instrument_key=','.join(keys))
-                        if price_response and price_response.status == 'success':
-                            break
-                    except Exception as e:
-                        logger.warning(f"Price fetch attempt {attempt+1} failed: {e}")
-                        time.sleep(0.5)
+                
+                try:
+                    # Use asyncio.to_thread for sync API calls in Python 3.9+
+                    price_response = await asyncio.to_thread(
+                        market_api.get_ltp, 
+                        instrument_key=','.join(keys)
+                    )
+                except AttributeError:
+                    # Fallback for Python < 3.9
+                    import concurrent.futures
+                    with concurrent.futures.ThreadPoolExecutor() as pool:
+                        price_response = await asyncio.get_event_loop().run_in_executor(
+                            pool, 
+                            market_api.get_ltp, 
+                            ','.join(keys)
+                        )
                 
                 if not price_response or price_response.status != 'success':
                     consecutive_errors += 1
                     if consecutive_errors >= max_consecutive_errors:
                         logger.critical(f"Price feed failed {consecutive_errors} times - flattening for safety")
-                        self.flatten_all("PRICE_FEED_FAILURE")
+                        await self.flatten_all_async("PRICE_FEED_FAILURE")
                         return
-                    time.sleep(settings.POLL_INTERVAL)
+                    await asyncio.sleep(settings.POLL_INTERVAL)
                     continue
                 
                 consecutive_errors = 0
@@ -123,28 +144,29 @@ class RiskManager:
 
                 current_pnl = self._calculate_pnl(prices)
                 
+                # Risk Checks
                 if self.max_spread_loss > 0 and current_pnl < -(self.max_spread_loss * 0.80):
                     logger.critical(f"Max risk breached: P&L={current_pnl:.2f}, Limit={self.max_spread_loss:.2f}")
-                    self.flatten_all("STOP_LOSS_MAX_RISK")
+                    await self.flatten_all_async("STOP_LOSS_MAX_RISK")
                     return
                 
                 stop_threshold = -(self.net_premium * settings.STOP_LOSS_PCT)
                 if self.net_premium > 0 and current_pnl < stop_threshold:
                     logger.critical(f"Stop loss hit: P&L={current_pnl:.2f}, Threshold={stop_threshold:.2f}")
-                    self.flatten_all("STOP_LOSS_PREMIUM")
+                    await self.flatten_all_async("STOP_LOSS_PREMIUM")
                     return
                 
                 target_pnl = self.net_premium * settings.TARGET_PROFIT_PCT
                 if self.net_premium > 0 and (current_pnl >= target_pnl - 0.1):
                     logger.info(f"Target profit reached: P&L={current_pnl:.2f}, Target={target_pnl:.2f}")
-                    self.flatten_all("TARGET_PROFIT")
+                    await self.flatten_all_async("TARGET_PROFIT")
                     return
 
                 self._update_dashboard_state(current_pnl)
-                time.sleep(settings.POLL_INTERVAL)
+                await asyncio.sleep(settings.POLL_INTERVAL)
 
-            except KeyboardInterrupt:
-                logger.info("Risk monitor interrupted by user")
+            except asyncio.CancelledError:
+                logger.info(f"Risk monitor cancelled for {self.trade_id}")
                 self.running = False
                 return
             except Exception as e:
@@ -153,9 +175,9 @@ class RiskManager:
                 consecutive_errors += 1
                 if consecutive_errors >= max_consecutive_errors:
                     logger.critical("Too many errors in risk monitor - emergency exit")
-                    self.flatten_all("MONITOR_ERROR")
+                    await self.flatten_all_async("MONITOR_ERROR")
                     return
-                time.sleep(5)
+                await asyncio.sleep(5)
 
     def _calculate_pnl(self, prices) -> float:
         pnl = 0.0
@@ -185,7 +207,7 @@ class RiskManager:
         if missing_data_count > 0:
             logger.critical(f"Incomplete P&L calc due to missing data on {missing_data_count} legs")
             if missing_data_count > len(self.legs) / 2:
-                self.flatten_all("DATA_FEED_LOSS")
+                asyncio.create_task(self.flatten_all_async("DATA_FEED_LOSS"))
         
         return pnl
 
@@ -196,45 +218,53 @@ class RiskManager:
         except Exception:
             pass
 
-    def flatten_all(self, reason="SIGNAL"):
-        from app.services.trading.execution import ExecutionEngine
-        
+    async def flatten_all_async(self, reason="SIGNAL"):
+        """Async version of flatten_all"""
+        if not self.running:
+            return
+            
         logger.critical(f"🚨 FLATTEN TRIGGERED: {reason}")
-        self.telegram.send(f"🚨 Position Exit: {reason}", "CRITICAL")
+        self.running = False
         
+        # Cancel GTTs using async wrapper
         if self.gtt_ids:
             logger.info(f"Cancelling {len(self.gtt_ids)} GTT orders...")
+            # Import here to avoid circular import at module level, but used locally
+            from app.services.trading.execution import ExecutionEngine
             executor = ExecutionEngine(self.api_client, self.db_writer, self.circuit_breaker)
             
             for gtt_id in self.gtt_ids:
-                cancelled = False
-                for _ in range(3):
-                    if executor.cancel_gtt_order(gtt_id):
-                        cancelled = True
-                        break
-                    time.sleep(0.5)
-                
-                if not cancelled:
-                    msg = f"❌ FATAL: Could not cancel GTT {gtt_id}. Manual intervention required."
-                    logger.critical(msg)
-                    self.telegram.send(msg, "CRITICAL")
+                try:
+                    await asyncio.to_thread(executor.cancel_gtt_order, gtt_id)
+                except Exception as e:
+                    logger.error(f"Failed to cancel GTT {gtt_id}: {e}")
         
+        # Atomic exit
+        from app.services.trading.execution import ExecutionEngine
         executor = ExecutionEngine(self.api_client, self.db_writer, self.circuit_breaker)
+        
         atomic_success = False
         for attempt in range(2):
             logger.info(f"Atomic exit attempt {attempt+1}...")
-            if executor.exit_all_positions(tag="VG30"):
-                atomic_success = True
-                logger.info("✅ Atomic exit successful")
-                break
-            time.sleep(2)
+            try:
+                success = await asyncio.to_thread(executor.exit_all_positions)
+                if success:
+                    atomic_success = True
+                    logger.info("✅ Atomic exit successful")
+                    break
+            except Exception as e:
+                logger.error(f"Atomic exit error: {e}")
+            await asyncio.sleep(2)
             
         if not atomic_success:
             logger.critical("Atomic exit failed - falling back to leg-by-leg")
             self.telegram.send("Atomic exit failed - manual closure initiated", "CRITICAL")
-            executor._flatten_legs(self.legs)
+            try:
+                await asyncio.to_thread(executor._flatten_legs, self.legs)
+            except Exception as e:
+                logger.critical(f"Emergency flatten failed: {e}")
             
-        final_pnl = self._get_final_pnl()
+        final_pnl = await asyncio.to_thread(self._get_final_pnl)
         self.db_writer.update_trade_exit(self.trade_id, reason, final_pnl)
         self.db_writer.log_risk_event("POSITION_EXIT", "INFO", reason, f"P&L: ₹{final_pnl:.2f}")
         self.circuit_breaker.record_trade_result(final_pnl)
@@ -243,7 +273,14 @@ class RiskManager:
             f"Position Closed\nReason: {reason}\nFinal P&L: ₹{final_pnl:,.2f}",
             "SUCCESS" if final_pnl > 0 else "WARNING"
         )
-        self.running = False
+        
+        # Call callback to remove from app state (avoids circular import)
+        if self.flatten_callback:
+            try:
+                self.flatten_callback(self.trade_id, reason)
+            except Exception as e:
+                logger.error(f"Flatten callback error: {e}")
+        
         logger.info(f"Risk monitor shutdown complete for {self.trade_id}")
 
     def _get_final_pnl(self) -> float:
