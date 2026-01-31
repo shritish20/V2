@@ -1,11 +1,10 @@
 """
-Analytics Engine - Preserved
+Analytics Engine - Production Fixed (No Queue)
 """
 import io
 import logging
 from datetime import date, datetime, timedelta
 from typing import Dict, Optional, Tuple
-from multiprocessing import Queue
 
 import requests
 import pandas as pd
@@ -28,11 +27,15 @@ from app.services.intelligence.calendar import CalendarEngine
 
 logger = logging.getLogger("VOLGUARD")
 
-class AnalyticsEngine:
-    def __init__(self, result_queue: Queue):
-        self.result_queue = result_queue
 
-    def run(self, config: Dict):
+class AnalyticsEngine:
+    """CPU-intensive analytics that must run in threadpool"""
+    
+    def run_sync(self, config: Dict) -> Dict:
+        """
+        Synchronous execution for threadpool usage.
+        Returns dict directly instead of using Queue.
+        """
         try:
             api_client = upstox_client.ApiClient()
             api_client.configuration.access_token = config['access_token']
@@ -67,7 +70,8 @@ class AnalyticsEngine:
             edge_metrics = self.get_edge_metrics(weekly_chain, monthly_chain, next_weekly_chain, vol_metrics.spot, vol_metrics, time_metrics)
             external_metrics = self.get_external_metrics(nifty_hist, participant_data, participant_yest, fii_net_change, data_date, economic_events)
 
-            result = {
+            return {
+                'status': 'success',
                 'timestamp': datetime.now(),
                 'time_metrics': time_metrics,
                 'vol_metrics': vol_metrics,
@@ -84,12 +88,11 @@ class AnalyticsEngine:
                 'struct_metrics_weekly': struct_metrics_weekly,
                 'struct_metrics_monthly': struct_metrics_monthly
             }
-            self.result_queue.put(('success', result))
         except Exception as e:
             logger.error(f"Analytics process error: {e}")
             import traceback
             traceback.print_exc()
-            self.result_queue.put(('error', str(e)))
+            return {'status': 'error', 'message': str(e)}
 
     def _parse_candle_response(self, response):
         if response.status != 'success':
