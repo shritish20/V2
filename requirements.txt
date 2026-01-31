@@ -1,0 +1,26 @@
+fastapi==0.109.0
+uvicorn[standard]==0.27.0
+pydantic==2.5.3
+pydantic-settings==2.1.0
+python-multipart==0.0.6
+
+# Original Trading Dependencies
+upstox-python-sdk==2.19.0
+groq==0.4.0
+pandas==2.1.4
+numpy==1.24.3
+requests==2.31.0
+yfinance==0.2.33
+arch==6.3.0
+scipy==1.11.4
+urllib3==2.0.7
+pytz==2023.3.post1
+psutil==5.9.6
+prometheus-client==0.19.0
+lxml==4.9.3
+xml.etree.ElementTree
+io
+sqlite3
+atexit
+signal
+concurrent.futures
