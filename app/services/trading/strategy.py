@@ -99,7 +99,7 @@ class StrategyFactory:
             return self._get_leg_details(df, row['strike'], type_)
         return None
 
-    def _calculate_defined_risk(self, legs: List[Dict], qty: int) -> float:
+        def _calculate_defined_risk(self, legs: List[Dict], qty: int) -> float:
         if not legs: 
             return 0.0
         
@@ -108,4 +108,112 @@ class StrategyFactory:
         net_credit = premiums - debits
         
         ce_legs = sorted([l for l in legs if l['type'] == 'CE'], key=lambda x: x['strike'])
-        pe_legs = sorted([l
+        pe_legs = sorted([l for l in legs if l['type'] == 'PE'], key=lambda x: x['strike'])
+        
+        call_risk = 0.0
+        put_risk = 0.0
+        
+        if len(ce_legs) >= 2:
+            shorts = [l for l in ce_legs if l['side'] == 'SELL']
+            longs = [l for l in ce_legs if l['side'] == 'BUY']
+            if shorts and longs:
+                width = longs[-1]['strike'] - shorts[0]['strike']
+                call_risk = width * qty
+
+        if len(pe_legs) >= 2:
+            shorts = [l for l in pe_legs if l['side'] == 'SELL']
+            longs = [l for l in pe_legs if l['side'] == 'BUY']
+            if shorts and longs:
+                width = shorts[-1]['strike'] - longs[0]['strike']
+                put_risk = width * qty
+        
+        max_structural_risk = max(call_risk, put_risk)
+        max_loss = max(0, max_structural_risk - net_credit)
+        
+        logger.info(f"🧮 Risk Calc: CallRisk={call_risk:.0f}, PutRisk={put_risk:.0f}, Credit={net_credit:.0f} -> MaxLoss={max_loss:.0f}")
+        return max_loss
+
+    def generate(self, mandate: TradingMandate, chain: pd.DataFrame, lot_size: int, vol_metrics: VolMetrics, spot: float, struct_metrics: StructMetrics) -> Tuple[List[Dict], float]:
+        if mandate.max_lots == 0 or chain.empty: 
+            return [], 0.0
+        qty = mandate.max_lots * lot_size
+        legs = []
+
+        # 1. IRON FLY
+        if mandate.suggested_structure == "IRON_FLY":
+            logger.info(f"🦅 Constructing Iron Fly | DTE={mandate.dte} | Spot={spot:.2f}")
+            atm_data = self._find_professional_atm(chain, spot)
+            if not atm_data: 
+                return [], 0.0
+            atm_strike, straddle_cost, interval = atm_data['strike'], atm_data['straddle_cost'], atm_data['interval']
+            wing_width = self._calculate_pro_wing_width(straddle_cost, vol_metrics, interval)
+            upper_wing, lower_wing = atm_strike + wing_width, atm_strike - wing_width
+            atm_call = self._get_leg_details(chain, atm_strike, 'CE')
+            atm_put = self._get_leg_details(chain, atm_strike, 'PE')
+            wing_call = self._get_leg_details(chain, upper_wing, 'CE')
+            wing_put = self._get_leg_details(chain, lower_wing, 'PE')
+            if not all([atm_call, atm_put, wing_call, wing_put]):
+                logger.error("Iron Fly incomplete: Missing liquid strikes")
+                return [], 0.0
+            legs = [
+                {**atm_call, 'side': 'SELL', 'role': 'CORE', 'qty': qty, 'structure': 'IRON_FLY'},
+                {**atm_put, 'side': 'SELL', 'role': 'CORE', 'qty': qty, 'structure': 'IRON_FLY'},
+                {**wing_call,'side': 'BUY', 'role': 'HEDGE','qty': qty, 'structure': 'IRON_FLY'},
+                {**wing_put, 'side': 'BUY', 'role': 'HEDGE','qty': qty, 'structure': 'IRON_FLY'}
+            ]
+
+        # 2. IRON CONDOR
+        elif mandate.suggested_structure == "IRON_CONDOR":
+            logger.info(f"🦅 Constructing Iron Condor | DTE={mandate.dte}")
+            short_delta = settings.DELTA_SHORT_MONTHLY if mandate.expiry_type == "MONTHLY" else settings.DELTA_SHORT_WEEKLY
+            legs = [
+                self._find_leg_by_delta(chain, 'CE', short_delta),
+                self._find_leg_by_delta(chain, 'PE', short_delta),
+                self._find_leg_by_delta(chain, 'CE', settings.DELTA_LONG_HEDGE),
+                self._find_leg_by_delta(chain, 'PE', settings.DELTA_LONG_HEDGE)
+            ]
+            if not all(legs): 
+                logger.error("Iron Condor incomplete")
+                return [], 0.0
+            legs = [{**l, 'side': 'SELL' if idx < 2 else 'BUY', 'role': 'CORE' if idx < 2 else 'HEDGE', 'qty': qty, 'structure': 'IRON_CONDOR'} for idx, l in enumerate(legs)]
+
+        # 3. DIRECTIONAL CREDIT SPREAD
+        elif mandate.suggested_structure in ["CREDIT_SPREAD", "BULL_PUT_SPREAD", "BEAR_CALL_SPREAD"]:
+            is_uptrend = vol_metrics.spot > vol_metrics.ma20 * (1 + settings.TREND_BULLISH_THRESHOLD/100)
+            is_bullish_pcr = struct_metrics.pcr > settings.PCR_BULLISH_THRESHOLD
+            
+            if is_uptrend or mandate.directional_bias in ["BULLISH", "MILDLY_BULLISH"]:
+                logger.info("📈 Direction: BULLISH. Deploying BULL PUT SPREAD.")
+                short = self._find_leg_by_delta(chain, 'PE', settings.DELTA_CREDIT_SHORT)
+                long = self._find_leg_by_delta(chain, 'PE', settings.DELTA_CREDIT_LONG)
+                if not all([short, long]): 
+                    return [], 0.0
+                legs = [
+                    {**short, 'side': 'SELL', 'role': 'CORE', 'qty': qty, 'structure': 'BULL_PUT_SPREAD'},
+                    {**long, 'side': 'BUY', 'role': 'HEDGE','qty': qty, 'structure': 'BULL_PUT_SPREAD'}
+                ]
+            else:
+                logger.info("📉 Direction: BEARISH. Deploying BEAR CALL SPREAD.")
+                short = self._find_leg_by_delta(chain, 'CE', settings.DELTA_CREDIT_SHORT)
+                long = self._find_leg_by_delta(chain, 'CE', settings.DELTA_CREDIT_LONG)
+                if not all([short, long]): 
+                    return [], 0.0
+                legs = [
+                    {**short, 'side': 'SELL', 'role': 'CORE', 'qty': qty, 'structure': 'BEAR_CALL_SPREAD'},
+                    {**long, 'side': 'BUY', 'role': 'HEDGE','qty': qty, 'structure': 'BEAR_CALL_SPREAD'}
+                ]
+
+        if not legs: 
+            return [], 0.0
+        for leg in legs:
+            if leg['ltp'] <= 0:
+                logger.error(f"❌ Invalid Leg Price: {leg['strike']} = {leg['ltp']}")
+                return [], 0.0
+
+        max_risk = self._calculate_defined_risk(legs, qty)
+        if max_risk > settings.MAX_LOSS_PER_TRADE:
+            logger.critical(f"⛔ Trade Rejected: Max Risk ₹{max_risk:,.2f} > Limit ₹{settings.MAX_LOSS_PER_TRADE:,.2f}")
+            from app.infrastructure.messaging import TelegramAlerter
+            TelegramAlerter().send(f"Trade Rejected: Risk ₹{max_risk:,.0f} exceeds limit", "WARNING")
+            return [], 0.0
+        return legs, max_risk
